@@ -665,19 +665,35 @@ async fn probe_existing_listener(postfix: &str) -> bool {
     )
 }
 
+#[inline]
+fn is_same_process_name_as_current(pid: usize) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        base::platform::linux::is_same_process_name_as_current(pid)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        use hbb_common::sysinfo::{Pid, System};
+        let mut sys = System::new();
+        let target_pid: Pid = pid.into();
+        let current_pid: Pid = (std::process::id() as usize).into();
+        sys.refresh_process(target_pid);
+        if target_pid != current_pid {
+            sys.refresh_process(current_pid);
+        }
+        if let (Some(p), Some(current)) = (sys.process(target_pid), sys.process(current_pid)) {
+            current.name() == p.name()
+        } else {
+            false
+        }
+    }
+}
+
 pub(crate) async fn check_pid(postfix: &str) -> bool {
     let pid_file = std::path::PathBuf::from(get_pid_file(postfix));
     if let Some(pid) = read_pid_file_secure(&pid_file) {
-        if pid > 0 {
-            let mut sys = hbb_common::sysinfo::System::new();
-            sys.refresh_processes();
-            if let Some(p) = sys.process(pid.into()) {
-                if let Some(current) = sys.process((std::process::id() as usize).into()) {
-                    if current.name() == p.name() && probe_existing_listener(postfix).await {
-                        return true;
-                    }
-                }
-            }
+        if pid > 0 && is_same_process_name_as_current(pid) && probe_existing_listener(postfix).await {
+            return true;
         }
     }
     if probe_existing_listener(postfix).await {
@@ -981,5 +997,18 @@ mod tests {
         assert!(ipc_pid_file.exists(), "pid marker should be preserved");
 
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn test_is_same_process_name_as_current_fast() {
+        let start = std::time::Instant::now();
+        assert!(super::is_same_process_name_as_current(std::process::id() as usize));
+        assert!(!super::is_same_process_name_as_current(usize::MAX));
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(200),
+            "is_same_process_name_as_current took too long: {:?}",
+            elapsed
+        );
     }
 }

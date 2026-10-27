@@ -1415,7 +1415,12 @@ fn select_server_uid_for_user_main_ipc(
     bail!("Multiple --server processes found for user main IPC");
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "linux")]
+fn running_server_uids_for_current_exe() -> ResultType<Vec<u32>> {
+    base::platform::linux::running_server_uids_for_current_exe()
+}
+
+#[cfg(target_os = "macos")]
 fn running_server_uids_for_current_exe() -> ResultType<Vec<u32>> {
     let current_exe = std::env::current_exe()?;
     let current_exe_path = std::fs::canonicalize(&current_exe)?;
@@ -2319,5 +2324,19 @@ mod test {
     #[test]
     fn test_select_server_uid_fails_when_multiple_servers_are_ambiguous() {
         assert!(select_server_uid_for_user_main_ipc(&[501, 502], None, false).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_running_server_uids_for_current_exe_fast_on_linux() {
+        let start = std::time::Instant::now();
+        let res = super::running_server_uids_for_current_exe();
+        assert!(res.is_ok());
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(200),
+            "running_server_uids_for_current_exe took too long: {:?}",
+            elapsed
+        );
     }
 }

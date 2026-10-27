@@ -511,6 +511,156 @@ pub fn get_home_dir_trusted() -> Option<PathBuf> {
     }
 }
 
+#[inline]
+pub fn proc_cmdline_first_arg(cmdline: &[u8]) -> String {
+    let mut parts = cmdline.split(|&b| b == 0).filter(|s| !s.is_empty());
+    let _ = parts.next();
+    parts
+        .next()
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .unwrap_or_default()
+}
+
+#[inline]
+pub fn proc_arg_matches(expected_arg: &str, actual_first_arg: &str) -> bool {
+    if expected_arg.is_empty() {
+        !actual_first_arg.starts_with("--")
+    } else {
+        expected_arg == actual_first_arg
+    }
+}
+
+#[inline]
+fn normalize_linux_exe_path(mut path: PathBuf) -> String {
+    if let Ok(linked) = path.read_link() {
+        path = linked;
+    }
+    let s = path.to_string_lossy();
+    let s = s.strip_suffix(" (deleted)").unwrap_or(&s);
+    s.to_lowercase()
+}
+
+/// Fast Linux `/proc` scan for a running process of the same executable whose first argument
+/// matches `arg`. Avoids `sysinfo::System::refresh_processes()`, which enumerates all threads
+/// (`/proc/<pid>/task/<tid>`) and multiple pseudo-files per thread across the entire system.
+pub fn check_process(arg: &str, same_uid: bool) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    let my_pid = std::process::id();
+    let my_uid = get_current_uid();
+    let target_exe = normalize_linux_exe_path(std::env::current_exe().unwrap_or_default());
+    if target_exe.is_empty() {
+        return false;
+    }
+
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return false;
+    };
+
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(pid_str) = file_name.to_str() else {
+            continue;
+        };
+        if !pid_str.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let Ok(pid) = pid_str.parse::<u32>() else {
+            continue;
+        };
+        if pid == my_pid {
+            continue;
+        }
+
+        let proc_dir = entry.path();
+        if same_uid {
+            let Ok(meta) = std::fs::metadata(&proc_dir) else {
+                continue;
+            };
+            if meta.uid() != my_uid {
+                continue;
+            }
+        }
+
+        let Ok(exe_path) = std::fs::read_link(proc_dir.join("exe")) else {
+            continue;
+        };
+        if normalize_linux_exe_path(exe_path) != target_exe {
+            continue;
+        }
+
+        let Ok(cmdline) = std::fs::read(proc_dir.join("cmdline")) else {
+            continue;
+        };
+        let parg = proc_cmdline_first_arg(&cmdline);
+        if proc_arg_matches(arg, &parg) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Fast Linux `/proc` scan for UIDs of running `--server` processes matching the current executable.
+pub fn running_server_uids_for_current_exe() -> ResultType<Vec<u32>> {
+    use std::os::unix::fs::MetadataExt;
+
+    let current_exe = std::env::current_exe()?;
+    let current_exe_path = std::fs::canonicalize(&current_exe)?;
+    let current_pid = std::process::id();
+    let mut server_uids = Vec::new();
+
+    for entry in std::fs::read_dir("/proc")?.flatten() {
+        let file_name = entry.file_name();
+        let Some(pid_str) = file_name.to_str() else {
+            continue;
+        };
+        if !pid_str.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let Ok(pid) = pid_str.parse::<u32>() else {
+            continue;
+        };
+        if pid == current_pid {
+            continue;
+        }
+
+        let proc_dir = entry.path();
+        let Ok(exe_link) = std::fs::read_link(proc_dir.join("exe")) else {
+            continue;
+        };
+        let Ok(process_path) = std::fs::canonicalize(exe_link) else {
+            continue;
+        };
+        if process_path != current_exe_path {
+            continue;
+        }
+
+        let Ok(cmdline) = std::fs::read(proc_dir.join("cmdline")) else {
+            continue;
+        };
+        if proc_cmdline_first_arg(&cmdline) != "--server" {
+            continue;
+        }
+
+        let Ok(meta) = std::fs::metadata(&proc_dir) else {
+            hbb_common::bail!("Failed to read --server process uid");
+        };
+        server_uids.push(meta.uid());
+    }
+    Ok(server_uids)
+}
+
+/// Fast check whether `pid` has the same process name (`comm`) as the current process.
+pub fn is_same_process_name_as_current(pid: usize) -> bool {
+    let Ok(my_comm) = std::fs::read_to_string("/proc/self/comm") else {
+        return false;
+    };
+    let Ok(target_comm) = std::fs::read_to_string(format!("/proc/{}/comm", pid)) else {
+        return false;
+    };
+    !my_comm.trim().is_empty() && my_comm.trim() == target_comm.trim()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -558,5 +708,96 @@ mod tests {
         assert_eq!(shell_quote("`id`"), "'`id`'");
         assert_eq!(shell_quote("a && b"), "'a && b'");
         assert_eq!(shell_quote("a | b"), "'a | b'");
+    }
+
+    #[test]
+    fn test_proc_cmdline_first_arg_and_matching() {
+        assert_eq!(
+            proc_cmdline_first_arg(b"/usr/bin/rustdesk\0--server\0"),
+            "--server"
+        );
+        assert_eq!(proc_cmdline_first_arg(b"/usr/bin/rustdesk\0"), "");
+        assert_eq!(proc_cmdline_first_arg(b""), "");
+
+        assert!(proc_arg_matches("", ""));
+        assert!(proc_arg_matches("", "123456"));
+        assert!(!proc_arg_matches("", "--server"));
+        assert!(proc_arg_matches("--server", "--server"));
+        assert!(!proc_arg_matches("--server", "--tray"));
+    }
+
+    #[test]
+    fn test_check_process_fast() {
+        let start = std::time::Instant::now();
+        assert!(!check_process("--non-existent-test-flag", true));
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(100),
+            "check_process took too long: {:?}",
+            elapsed
+        );
+    }
+
+    #[test]
+    fn test_running_server_uids_for_current_exe_fast() {
+        let start = std::time::Instant::now();
+        let res = running_server_uids_for_current_exe();
+        assert!(res.is_ok());
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(100),
+            "running_server_uids_for_current_exe took too long: {:?}",
+            elapsed
+        );
+    }
+
+    #[test]
+    fn test_is_same_process_name_as_current_fast() {
+        let start = std::time::Instant::now();
+        assert!(is_same_process_name_as_current(std::process::id() as usize));
+        assert!(!is_same_process_name_as_current(usize::MAX));
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(50),
+            "is_same_process_name_as_current took too long: {:?}",
+            elapsed
+        );
+    }
+
+    #[test]
+    fn test_check_process_detects_live_matching_child_and_perf_benchmark() {
+        if std::env::var("RUSTDESK_TEST_CHILD_SLEEP").is_ok() {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            return;
+        }
+        let exe = std::env::current_exe().unwrap();
+        let mut child = std::process::Command::new(&exe)
+            .arg("--exact")
+            .arg("platform::linux::tests::test_check_process_detects_live_matching_child_and_perf_benchmark")
+            .env("RUSTDESK_TEST_CHILD_SLEEP", "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+
+        // Wait briefly for child process to start executing
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        let start = std::time::Instant::now();
+        let found_same_uid = check_process("--exact", true);
+        let elapsed = start.elapsed();
+        println!("check_process('--exact', true) took {:?}", elapsed);
+        let not_found_other = check_process("--non-existent-flag", true);
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(found_same_uid, "Should detect live child process with --exact");
+        assert!(!not_found_other, "Should not detect non-existent flag");
+        assert!(
+            elapsed < std::time::Duration::from_millis(50),
+            "check_process took too long: {:?}",
+            elapsed
+        );
     }
 }

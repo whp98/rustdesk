@@ -95,19 +95,21 @@ pub fn core_main() -> Option<CoreMainAction> {
     }
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     if args.is_empty() {
-        #[cfg(target_os = "linux")]
-        let should_check_start_tray = crate::check_process("--server", false);
-        // We can use `crate::check_process("--server", false)` on Windows.
-        // Because `--server` process is the System user's process. We can't get the arguments in `check_process()`.
-        // We can assume that self service running means the server is also running on Windows.
-        #[cfg(target_os = "windows")]
-        let should_check_start_tray = crate::platform::is_self_service_running()
-            && crate::platform::is_cur_exe_the_installed();
-        if should_check_start_tray && !crate::check_process("--tray", true) {
+        std::thread::spawn(|| {
             #[cfg(target_os = "linux")]
-            hbb_common::allow_err!(crate::platform::check_autostart_config());
-            hbb_common::allow_err!(crate::run_me(vec!["--tray"]));
-        }
+            let should_check_start_tray = crate::check_process("--server", false);
+            // We can use `crate::check_process("--server", false)` on Windows.
+            // Because `--server` process is the System user's process. We can't get the arguments in `check_process()`.
+            // We can assume that self service running means the server is also running on Windows.
+            #[cfg(target_os = "windows")]
+            let should_check_start_tray = crate::platform::is_self_service_running()
+                && crate::platform::is_cur_exe_the_installed();
+            if should_check_start_tray && !crate::check_process("--tray", true) {
+                #[cfg(target_os = "linux")]
+                hbb_common::allow_err!(crate::platform::check_autostart_config());
+                hbb_common::allow_err!(crate::run_me(vec!["--tray"]));
+            }
+        });
     }
     #[cfg(not(debug_assertions))]
     #[cfg(not(any(target_os = "android", target_os = "ios")))]

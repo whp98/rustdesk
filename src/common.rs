@@ -2198,48 +2198,55 @@ pub fn check_process(arg: &str, same_session_id: bool) -> bool {
 #[cfg(not(all(target_os = "windows", not(target_pointer_width = "64"))))]
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub fn check_process(arg: &str, mut same_uid: bool) -> bool {
-    #[cfg(target_os = "macos")]
-    if !crate::platform::is_root() && !same_uid {
-        log::warn!("Can not get other process's command line arguments on macos without root");
-        same_uid = true;
+    #[cfg(target_os = "linux")]
+    {
+        return base::platform::linux::check_process(arg, same_uid);
     }
-    use hbb_common::sysinfo::System;
-    let mut sys = System::new();
-    sys.refresh_processes();
-    let mut path = std::env::current_exe().unwrap_or_default();
-    if let Ok(linked) = path.read_link() {
-        path = linked;
-    }
-    let path = path.to_string_lossy().to_lowercase();
-    let my_uid = sys
-        .process((std::process::id() as usize).into())
-        .map(|x| x.user_id())
-        .unwrap_or_default();
-    for (_, p) in sys.processes().iter() {
-        let mut cur_path = p.exe().to_path_buf();
-        if let Ok(linked) = cur_path.read_link() {
-            cur_path = linked;
+    #[cfg(not(target_os = "linux"))]
+    {
+        #[cfg(target_os = "macos")]
+        if !crate::platform::is_root() && !same_uid {
+            log::warn!("Can not get other process's command line arguments on macos without root");
+            same_uid = true;
         }
-        if cur_path.to_string_lossy().to_lowercase() != path {
-            continue;
+        use hbb_common::sysinfo::System;
+        let mut sys = System::new();
+        sys.refresh_processes();
+        let mut path = std::env::current_exe().unwrap_or_default();
+        if let Ok(linked) = path.read_link() {
+            path = linked;
         }
-        if p.pid().to_string() == std::process::id().to_string() {
-            continue;
-        }
-        if same_uid && p.user_id() != my_uid {
-            continue;
-        }
-        // on mac, p.cmd() get "/Applications/RustDesk.app/Contents/MacOS/RustDesk", "XPC_SERVICE_NAME=com.carriez.RustDesk_server"
-        let parg = if p.cmd().len() <= 1 { "" } else { &p.cmd()[1] };
-        if arg.is_empty() {
-            if !parg.starts_with("--") {
+        let path = path.to_string_lossy().to_lowercase();
+        let my_uid = sys
+            .process((std::process::id() as usize).into())
+            .map(|x| x.user_id())
+            .unwrap_or_default();
+        for (_, p) in sys.processes().iter() {
+            let mut cur_path = p.exe().to_path_buf();
+            if let Ok(linked) = cur_path.read_link() {
+                cur_path = linked;
+            }
+            if cur_path.to_string_lossy().to_lowercase() != path {
+                continue;
+            }
+            if p.pid().to_string() == std::process::id().to_string() {
+                continue;
+            }
+            if same_uid && p.user_id() != my_uid {
+                continue;
+            }
+            // on mac, p.cmd() get "/Applications/RustDesk.app/Contents/MacOS/RustDesk", "XPC_SERVICE_NAME=com.carriez.RustDesk_server"
+            let parg = if p.cmd().len() <= 1 { "" } else { &p.cmd()[1] };
+            if arg.is_empty() {
+                if !parg.starts_with("--") {
+                    return true;
+                }
+            } else if arg == parg {
                 return true;
             }
-        } else if arg == parg {
-            return true;
         }
+        false
     }
-    false
 }
 
 async fn secure_tcp_impl(conn: &mut Stream, key: &str, log_on_success: bool) -> ResultType<()> {
@@ -3585,5 +3592,34 @@ mod tests {
         // `decode_id_pk` is the same blob minus the fingerprint, so the field is invisible to
         // non-WebRTC handshakes.
         assert_eq!(decode_id_pk(&signed, &pk).unwrap(), (id, their_pk));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_linux_proc_cmdline_arg_matching_and_proc_scan() {
+        assert_eq!(
+            base::platform::linux::proc_cmdline_first_arg(b"/usr/bin/rustdesk\0--server\0"),
+            "--server"
+        );
+        assert_eq!(
+            base::platform::linux::proc_cmdline_first_arg(b"/usr/bin/rustdesk\0"),
+            ""
+        );
+        assert_eq!(base::platform::linux::proc_cmdline_first_arg(b""), "");
+
+        assert!(base::platform::linux::proc_arg_matches("", ""));
+        assert!(base::platform::linux::proc_arg_matches("", "123456"));
+        assert!(!base::platform::linux::proc_arg_matches("", "--server"));
+        assert!(base::platform::linux::proc_arg_matches("--server", "--server"));
+        assert!(!base::platform::linux::proc_arg_matches("--server", "--tray"));
+
+        let start = std::time::Instant::now();
+        let _ = super::check_process("--non-existent-test-flag", true);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(200),
+            "check_process took too long: {:?}",
+            elapsed
+        );
     }
 }
